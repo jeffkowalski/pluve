@@ -24,7 +24,9 @@ results.first['values'].each do |item|
   else
     if valve
       off = time
-      results = flume_client.query "select value from flow where time >= '#{on}' and time <= '#{off}'"
+      p "on = #{on}, off = #{off}" if valve == 18
+      results = flume_client.query "select value from flow where time > '#{on}' and time < '#{off}'"
+      pp results if valve == 18
       if results.count.positive?
         results.first['values'].each do |rate|
           time = Time.iso8601(rate['time'])
