@@ -47,7 +47,7 @@ end
 pluve_client.write_points data, 's'
 
 
-meanr   = pluve_client.query 'select mean(value)   from flow where time > now()-48h group by valve'
+meanr   = pluve_client.query 'select mean(value)   from flow where time > now()-1w group by valve'
 stddevr = pluve_client.query 'select stddev(value) from flow group by valve'
 medianr = pluve_client.query 'select median(value) from flow group by valve'
 
