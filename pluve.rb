@@ -4,9 +4,9 @@
 require 'influxdb'
 require 'time'
 
-ospi_client  = InfluxDB::Client.new url: 'http://carbon.local:8086/ospi'
-flume_client = InfluxDB::Client.new url: 'http://carbon.local:8086/flume'
-pluve_client = InfluxDB::Client.new url: 'http://carbon.local:8086/pluve'
+ospi_client  = InfluxDB::Client.new url: 'http://cube.local:8086/ospi'
+flume_client = InfluxDB::Client.new url: 'http://cube.local:8086/flume'
+pluve_client = InfluxDB::Client.new url: 'http://cube.local:8086/pluve'
 
 data = []
 results = ospi_client.query 'select * from valves where time >= now()-25h'
