@@ -7,12 +7,16 @@ Bundler.require(:default)
 class Pluve < RecorderBotBase
   no_commands do
     def main
-      ospi_client  = InfluxDB::Client.new url: 'http://cube.local:8086/ospi'
-      flume_client = InfluxDB::Client.new url: 'http://cube.local:8086/flume'
-      pluve_client = InfluxDB::Client.new url: 'http://cube.local:8086/pluve'
+      ospi_client  = new_influxdb_client('ospi')
+      flume_client = new_influxdb_client('flume')
+      pluve_client = new_influxdb_client('pluve')
 
       data = []
       results = ospi_client.query 'select * from valves where time >= now()-25h'
+      if results.nil? || results.first.nil?
+        @logger.error 'no ospi data to inspect'
+        return
+      end
       valve = nil
       on = nil
       off = nil
