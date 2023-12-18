@@ -14,7 +14,7 @@ class Pluve < RecorderBotBase
       data = []
       results = ospi_client.query 'select * from valves where time >= now()-25h'
       if results.nil? || results.first.nil?
-        @logger.error 'no ospi data to inspect'
+        @logger.warn 'no ospi data to inspect'
         return
       end
       valve = nil
