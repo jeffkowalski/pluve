@@ -22,9 +22,10 @@ class Pluve < RecorderBotBase
       # For 6-day irrigation schedule, look back 26-30 hours to ensure we catch
       # the most recent complete irrigation cycle
       lookback_hours = ENV['PLUVE_LOOKBACK_HOURS']&.to_i || 30
+      lookback_start = Time.now - (lookback_hours * 3600)
 
       # Get valve events from specified time window
-      results = ospi_client.query "select * from valves where time >= now()-#{lookback_hours}h"
+      results = ospi_client.query "select * from valves where time >= '#{lookback_start.iso8601}'"
       if results.nil? || results.first.nil?
         @logger.warn 'no ospi data to inspect'
         return
