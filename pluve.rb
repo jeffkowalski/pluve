@@ -12,7 +12,6 @@ FLOW_INCREASE_THRESHOLD = 0.1 # GPM increase to consider valve-related flow
 
 class Pluve < RecorderBotBase
   no_commands do
-
     def main
       ospi_client  = new_influxdb_client('ospi')
       flume_client = new_influxdb_client('flume')
@@ -81,9 +80,7 @@ class Pluve < RecorderBotBase
 
         if value.positive?
           # Valve turning on
-          if current_valve
-            @logger.error "out-of-sequence: valve #{value} turned on but valve #{current_valve} was still on at #{time}"
-          end
+          @logger.error "out-of-sequence: valve #{value} turned on but valve #{current_valve} was still on at #{time}" if current_valve
           current_valve = value
           on_time = time
         else
@@ -95,12 +92,10 @@ class Pluve < RecorderBotBase
             # Validate sequence and timing for irrigation program
             validate_irrigation_sequence(current_valve, on_time, duration_minutes)
 
-            events.push({
-              valve: current_valve,
-              on_time: on_time,
-              off_time: off_time,
-              duration_minutes: duration_minutes
-            })
+            events.push({ valve: current_valve,
+                          on_time: on_time,
+                          off_time: off_time,
+                          duration_minutes: duration_minutes })
 
             @logger.debug "Valve #{current_valve}: #{duration_minutes.round(1)} minutes"
           else
@@ -121,12 +116,10 @@ class Pluve < RecorderBotBase
 
       # Expected start times for each valve (3am + valve delays)
       # Valve 1 starts at 3:00am, each subsequent valve starts 18-30 min later (valve runtime + 10 min pause)
-      expected_start_hour = 3 + ((valve - 1) * 18) / 60  # Conservative estimate using min runtime
+      # Conservative estimate using min runtime
 
-      if hour >= 3 && hour <= 18  # Reasonable irrigation window
-        if duration < 6 || duration > 25  # Outside expected range (allowing for weather adjustments)
-          @logger.warn "Valve #{valve} ran for #{duration.round(1)} minutes - outside normal 8-20 minute range"
-        end
+      if hour >= 3 && hour <= 18 # Reasonable irrigation window
+        @logger.warn "Valve #{valve} ran for #{duration.round(1)} minutes - outside normal 8-20 minute range" if duration < 6 || duration > 25 # Outside expected range (allowing for weather adjustments)
       else
         @logger.info "Valve #{valve} ran outside normal program hours at #{start_time.strftime('%H:%M')}"
       end
@@ -164,7 +157,7 @@ class Pluve < RecorderBotBase
       # Filter out obvious outliers (more than 3 standard deviations from median)
       values = flow_data.map { |d| d[:value] }
       median = values.sort[values.length / 2]
-      std_dev = Math.sqrt(values.map { |v| (v - median) ** 2 }.sum / values.length)
+      std_dev = Math.sqrt(values.map { |v| (v - median)**2 }.sum / values.length)
 
       flow_data.select { |d| (d[:value] - median).abs <= 3 * std_dev }
     end
@@ -172,17 +165,17 @@ class Pluve < RecorderBotBase
     def calculate_flow_metrics(baseline_flow, valve_flow, event)
       baseline_median = baseline_flow.sort[baseline_flow.length / 2]
       baseline_mean = baseline_flow.sum / baseline_flow.length.to_f
-      baseline_std = Math.sqrt(baseline_flow.map { |v| (v - baseline_mean) ** 2 }.sum / baseline_flow.length)
+      baseline_std = Math.sqrt(baseline_flow.map { |v| (v - baseline_mean)**2 }.sum / baseline_flow.length)
 
       valve_values = valve_flow.map { |d| d[:value] }
       valve_median = valve_values.sort[valve_values.length / 2]
       valve_mean = valve_values.sum / valve_values.length.to_f
       valve_max = valve_values.max
-      valve_std = Math.sqrt(valve_values.map { |v| (v - valve_mean) ** 2 }.sum / valve_values.length)
+      valve_std = Math.sqrt(valve_values.map { |v| (v - valve_mean)**2 }.sum / valve_values.length)
 
       # Calculate net flow increase
       net_flow_increase = valve_median - baseline_median
-      flow_stability = valve_std / valve_mean  # coefficient of variation
+      flow_stability = valve_std / valve_mean # coefficient of variation
 
       {
         baseline_median: baseline_median,
@@ -226,14 +219,14 @@ class Pluve < RecorderBotBase
 
     def update_anomaly_metrics(pluve_client)
       # Calculate statistics for each valve over different time windows
-      time_windows = ['7d', '30d', '90d']
+      time_windows = %w[7d 30d 90d]
 
       time_windows.each do |window|
         # Get flow metrics for each valve
-        metrics_query = "select mean(net_flow_increase), stddev(net_flow_increase), " \
-                       "mean(valve_max), stddev(valve_max), " \
-                       "mean(flow_stability), stddev(flow_stability) " \
-                       "from valve_metrics where time > now()-#{window} group by valve"
+        metrics_query = 'select mean(net_flow_increase), stddev(net_flow_increase), ' \
+                        'mean(valve_max), stddev(valve_max), ' \
+                        'mean(flow_stability), stddev(flow_stability) ' \
+                        "from valve_metrics where time > now()-#{window} group by valve"
 
         results = pluve_client.query metrics_query
         next if results.empty?
@@ -262,27 +255,26 @@ class Pluve < RecorderBotBase
             get_valve_population_stddev(results, 'mean_2')
           )
 
-          anomaly_data.push({
-            series: 'anomaly_scores',
-            values: {
-              flow_z_score: flow_z_score,
-              max_flow_z_score: max_flow_z_score,
-              stability_z_score: stability_z_score,
-              composite_score: [flow_z_score.abs, max_flow_z_score.abs, stability_z_score.abs].max
-            },
-            tags: {
-              valve: valve_num,
-              window: window
-            }
-          })
+          anomaly_data.push({ series: 'anomaly_scores',
+                              values: {
+                                flow_z_score: flow_z_score,
+                                max_flow_z_score: max_flow_z_score,
+                                stability_z_score: stability_z_score,
+                                composite_score: [flow_z_score.abs, max_flow_z_score.abs, stability_z_score.abs].max
+                              },
+                              tags: {
+                                valve: valve_num,
+                                window: window
+                              } })
         end
 
         pluve_client.write_points anomaly_data, 's' unless anomaly_data.empty?
       end
     end
 
-    def calculate_z_score(value, std_dev, population_mean, population_std)
+    def calculate_z_score(value, _std_dev, population_mean, population_std)
       return 0.0 if population_std.nil? || population_std.zero?
+
       (value - population_mean) / population_std
     end
 
@@ -294,7 +286,7 @@ class Pluve < RecorderBotBase
     def get_valve_population_stddev(results, field)
       values = results.map { |r| r['values'][0][field] }.compact
       mean = values.sum / values.length.to_f
-      Math.sqrt(values.map { |v| (v - mean) ** 2 }.sum / values.length)
+      Math.sqrt(values.map { |v| (v - mean)**2 }.sum / values.length)
     end
   end
 end
