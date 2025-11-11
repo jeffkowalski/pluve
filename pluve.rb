@@ -5,9 +5,12 @@ require 'bundler/setup'
 Bundler.require(:default)
 
 # Configuration constants
-BASELINE_MINUTES = 5      # Minutes before valve activation to establish baseline
-RAMP_UP_MINUTES = 2       # Minutes to skip after valve turns on (reduced for shorter runtimes)
-MIN_VALVE_RUNTIME = 6     # Minimum minutes for a valve run to be analyzed (just below your 8min minimum)
+# Adjusted to avoid Flume/OSPI timing issue where Flume samples at XX:00:00 capture flow from
+# valves opening at XX:00:01. Baseline window ends 1 minute before valve opens to avoid contamination.
+# Flume samples flow every 60 seconds, so parameters are in whole minutes
+BASELINE_MINUTES = 3      # Minutes of baseline data (excludes last minute before valve opens)
+RAMP_UP_MINUTES = 1       # Minutes to skip after valve turns on (first sample may be transitional)
+MIN_VALVE_RUNTIME = 3.0   # Minimum minutes for a valve run to be analyzed (need 2+ stable samples)
 FLOW_INCREASE_THRESHOLD = 0.1 # GPM increase to consider valve-related flow
 
 class Pluve < RecorderBotBase
@@ -115,19 +118,22 @@ class Pluve < RecorderBotBase
       hour = start_time.hour
 
       # Expected start times for each valve (3am + valve delays)
-      # Valve 1 starts at 3:00am, each subsequent valve starts 18-30 min later (valve runtime + 10 min pause)
-      # Conservative estimate using min runtime
+      # Valve 1 starts at 3:00am, each subsequent valve starts variable time later based on runtime + pause
+      # OSPI auto-adjusts runtime based on ETo: winter 2-3 min, summer 8-20 min
+      # Rain delay feature may also pause valves for extended periods
 
       if hour >= 3 && hour <= 18 # Reasonable irrigation window
-        @logger.warn "Valve #{valve} ran for #{duration.round(1)} minutes - outside normal 8-20 minute range" if duration < 6 || duration > 25 # Outside expected range (allowing for weather adjustments)
+        @logger.warn "Valve #{valve} ran for #{duration.round(1)} minutes - unusually short or long" if duration < 1.5 || duration > 25 # Flag only extreme outliers
       else
         @logger.info "Valve #{valve} ran outside normal program hours at #{start_time.strftime('%H:%M')}"
       end
     end
 
     def get_baseline_flow(flume_client, valve_on_time, baseline_minutes)
-      baseline_start = valve_on_time - (baseline_minutes * 60)
-      baseline_end = valve_on_time
+      # End baseline window 60 seconds before valve opens to avoid contaminated sample
+      # (Flume samples at XX:00:00 appear to capture flow from valves opening at XX:00:01)
+      baseline_end = valve_on_time - 60
+      baseline_start = baseline_end - (baseline_minutes * 60)
 
       query = "select value from flow where time > '#{baseline_start.iso8601}' and time < '#{baseline_end.iso8601}'"
       results = flume_client.query query
