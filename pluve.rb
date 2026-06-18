@@ -4,14 +4,47 @@
 require 'bundler/setup'
 Bundler.require(:default)
 
-# Configuration constants
-# Adjusted to avoid Flume/OSPI timing issue where Flume samples at XX:00:00 capture flow from
-# valves opening at XX:00:01. Baseline window ends 1 minute before valve opens to avoid contamination.
-# Flume samples flow every 60 seconds, so parameters are in whole minutes
-BASELINE_MINUTES = 3      # Minutes of baseline data (excludes last minute before valve opens)
-RAMP_UP_MINUTES = 1       # Minutes to skip after valve turns on (first sample may be transitional)
-MIN_VALVE_RUNTIME = 3.0   # Minimum minutes for a valve run to be analyzed (need 2+ stable samples)
-FLOW_INCREASE_THRESHOLD = 0.1 # GPM increase to consider valve-related flow
+# Pluve records, for every irrigation valve run, a robust set of flow metrics
+# derived from the Flume water meter, so that aberrant flow (a broken, stuck,
+# or blocked valve) can later be detected by comparing each valve to ITS OWN
+# history.
+#
+# Data model and timing facts this code relies on (verified against raw data):
+#   * Flume samples once per minute. A sample timestamped T reports the volume
+#     (gallons, ~= average GPM) flowing during the interval [T, T+60).
+#   * OpenSprinkler runs stations sequentially with a station delay (~10 min
+#     observed), so the period immediately before/after a run is normally quiet
+#     and usable as a baseline.
+#   * Flow reaches full rate within the first complete minute: there is no slow
+#     physical ramp. The low readings at a run's edges are PARTIAL-MINUTE
+#     artifacts (the bucket only partly overlaps the run), not ramp-up.
+#
+# Because of the last point we do NOT skip a fixed "ramp" minute. Instead we
+# integrate volume over the run: each boundary bucket already contains only the
+# volume that actually flowed during its overlap with the run, so dividing total
+# volume by the true run duration yields the correct average rate even for short
+# runs and arbitrary sub-minute alignment.
+
+# Flume sampling cadence, seconds. A bucket at time T covers [T, T+60).
+BUCKET_SECONDS = 60
+
+# A run shorter than this yields too little signal to bother recording.
+MIN_VALVE_RUNTIME_MIN = 1.0
+
+# Baseline = quiet flow just outside the run. We measure a window before (and,
+# when the station gap allows, after) the run. GUARD seconds nearest the run are
+# excluded because that boundary bucket overlaps the run itself.
+BASELINE_WINDOW_SECONDS = 180 # 3 minutes of baseline samples
+BASELINE_GUARD_SECONDS  = 60  # skip the minute adjacent to the valve transition
+
+# Interior buckets are those fully inside the run (no partial-minute edge).
+# CV / steady-state median are only meaningful with at least this many of them.
+MIN_INTERIOR_FOR_STEADY = 4
+
+# Quality thresholds (absolute GPM). These are deliberately loose; the real
+# anomaly decision is made per-valve-against-its-own-history in the consumer.
+FLOW_FLOOR_GPM     = 0.5 # delivered rate below this => effectively no flow
+QUIET_BASELINE_GPM = 0.5 # baseline above this => not a clean baseline
 
 class Pluve < RecorderBotBase
   no_commands do
@@ -20,57 +53,51 @@ class Pluve < RecorderBotBase
       flume_client = new_influxdb_client('flume')
       pluve_client = new_influxdb_client('pluve')
 
-      # Determine lookback period based on run frequency
-      # For 6-day irrigation schedule, look back 26-30 hours to ensure we catch
-      # the most recent complete irrigation cycle
+      # For a multi-day irrigation schedule, look back far enough to catch the
+      # most recent complete cycle. Idempotent: re-running overwrites the same
+      # per-run points (keyed by valve + on_time), it does not duplicate them.
       lookback_hours = ENV['PLUVE_LOOKBACK_HOURS']&.to_i || 30
       lookback_start = Time.now - (lookback_hours * 3600)
 
-      # Get valve events from specified time window
       results = ospi_client.query "select * from valves where time >= '#{lookback_start.iso8601}'"
       if results.nil? || results.first.nil?
         @logger.warn 'no ospi data to inspect'
         return
       end
 
-      valve_events = parse_valve_events(results.first['values'])
-      flow_data = []
-      baseline_data = []
+      events = parse_valve_events(results.first['values'])
 
-      valve_events.each do |event|
-        next if event[:duration_minutes] < MIN_VALVE_RUNTIME
+      metric_points = []
+      flow_points = []
 
-        @logger.debug "Processing valve #{event[:valve]}: #{event[:duration_minutes]} minutes"
+      events.each_with_index do |event, idx|
+        next if event[:duration_minutes] < MIN_VALVE_RUNTIME_MIN
 
-        # Get baseline flow before valve activation
-        baseline_flow = get_baseline_flow(flume_client, event[:on_time], BASELINE_MINUTES)
-        next unless baseline_flow
+        prev_off = idx.positive? ? events[idx - 1][:off_time] : nil
+        next_on  = idx < events.length - 1 ? events[idx + 1][:on_time] : nil
 
-        # Get flow during valve operation (excluding ramp-up period)
-        valve_flow = get_valve_flow(flume_client, event[:on_time], event[:off_time], RAMP_UP_MINUTES)
-        next unless valve_flow
+        metrics = analyze_run(flume_client, event, prev_off, next_on)
+        next unless metrics # no usable flume data at all
 
-        # Calculate flow metrics
-        metrics = calculate_flow_metrics(baseline_flow, valve_flow, event)
+        metric_points.push(build_metric_point(metrics, event))
+        flow_points.concat(build_flow_points(metrics[:run_buckets], event[:valve]))
 
-        # Only include if we detected actual valve-related flow increase
-        if metrics[:net_flow_increase] > FLOW_INCREASE_THRESHOLD
-          flow_data.concat(create_flow_data_points(valve_flow, event[:valve]))
-          baseline_data.push(create_baseline_data_point(metrics, event[:valve]))
-        else
-          @logger.warn "Valve #{event[:valve]} showed no significant flow increase - possible malfunction or background usage interference"
+        unless metrics[:flow_detected]
+          @logger.warn "valve #{event[:valve]} ran #{event[:duration_minutes].round(1)} min but " \
+                       "delivered only #{metrics[:delivered_gpm].round(2)} GPM - recorded as no-flow"
         end
       end
 
-      # Write processed data
-      pluve_client.write_points flow_data, 's' unless flow_data.empty?
-      pluve_client.write_points baseline_data, 's' unless baseline_data.empty?
-
-      # Calculate and store anomaly detection metrics
-      update_anomaly_metrics(pluve_client)
+      unless options[:dry_run]
+        pluve_client.write_points metric_points, 's' unless metric_points.empty?
+        pluve_client.write_points flow_points, 's' unless flow_points.empty?
+      end
+      @logger.info "recorded #{metric_points.length} valve runs"
     end
 
     private
+
+    # ---- valve event parsing -------------------------------------------------
 
     def parse_valve_events(valve_data)
       events = []
@@ -82,217 +109,154 @@ class Pluve < RecorderBotBase
         value = item['value']
 
         if value.positive?
-          # Valve turning on
-          @logger.error "out-of-sequence: valve #{value} turned on but valve #{current_valve} was still on at #{time}" if current_valve
+          @logger.error "out-of-sequence: valve #{value} on while valve #{current_valve} still on at #{time}" if current_valve
           current_valve = value
           on_time = time
-        else
-          # Valve turning off
-          if current_valve && on_time
-            off_time = time
-            duration_minutes = (off_time - on_time) / 60.0
-
-            # Validate sequence and timing for irrigation program
-            validate_irrigation_sequence(current_valve, on_time, duration_minutes)
-
-            events.push({ valve: current_valve,
-                          on_time: on_time,
-                          off_time: off_time,
-                          duration_minutes: duration_minutes })
-
-            @logger.debug "Valve #{current_valve}: #{duration_minutes.round(1)} minutes"
-          else
-            @logger.error "out-of-sequence: valve turned off but no valve was on at #{time}"
-          end
-
+        elsif current_valve && on_time
+          events.push({ valve: current_valve,
+                        on_time: on_time,
+                        off_time: time,
+                        duration_minutes: (time - on_time) / 60.0 })
           current_valve = nil
           on_time = nil
+        else
+          @logger.error "out-of-sequence: valve off but none was on at #{time}"
         end
       end
 
       events
     end
 
-    def validate_irrigation_sequence(valve, start_time, duration)
-      # Check if this looks like part of the regular 3am program
-      hour = start_time.hour
+    # ---- per-run analysis ----------------------------------------------------
 
-      # Expected start times for each valve (3am + valve delays)
-      # Valve 1 starts at 3:00am, each subsequent valve starts variable time later based on runtime + pause
-      # OSPI auto-adjusts runtime based on ETo: winter 2-3 min, summer 8-20 min
-      # Rain delay feature may also pause valves for extended periods
+    # Returns a metrics hash, or nil if there is no usable flume data.
+    def analyze_run(flume_client, event, prev_off, next_on)
+      on  = event[:on_time]
+      off = event[:off_time]
+      duration_min = (off - on) / 60.0
 
-      if hour >= 3 && hour <= 18 # Reasonable irrigation window
-        @logger.warn "Valve #{valve} ran for #{duration.round(1)} minutes - unusually short or long" if duration < 1.5 || duration > 25 # Flag only extreme outliers
-      else
-        @logger.info "Valve #{valve} ran outside normal program hours at #{start_time.strftime('%H:%M')}"
+      # One query spanning baseline-before .. baseline-after, sliced in Ruby.
+      fetch_start = on - BASELINE_GUARD_SECONDS - BASELINE_WINDOW_SECONDS
+      fetch_end   = off + BASELINE_GUARD_SECONDS + BASELINE_WINDOW_SECONDS
+      buckets = fetch_flow(flume_client, fetch_start, fetch_end)
+      return nil if buckets.empty?
+
+      baseline_before = baseline_window(buckets, on - BASELINE_GUARD_SECONDS - BASELINE_WINDOW_SECONDS,
+                                        on - BASELINE_GUARD_SECONDS, prev_off)
+      baseline_after  = baseline_window(buckets, off + BASELINE_GUARD_SECONDS,
+                                        off + BASELINE_GUARD_SECONDS + BASELINE_WINDOW_SECONDS, nil, next_on)
+
+      # Use the before-baseline for subtraction; fall back to after if missing.
+      baseline_gpm = baseline_before || baseline_after || 0.0
+
+      # Buckets overlapping [on, off): a bucket at tb covers [tb, tb+60).
+      run_buckets = buckets.select do |b|
+        tb = b[:time].to_f
+        tb < off.to_f && (tb + BUCKET_SECONDS) > on.to_f
       end
-    end
+      return nil if run_buckets.empty?
 
-    def get_baseline_flow(flume_client, valve_on_time, baseline_minutes)
-      # End baseline window 60 seconds before valve opens to avoid contaminated sample
-      # (Flume samples at XX:00:00 appear to capture flow from valves opening at XX:00:01)
-      baseline_end = valve_on_time - 60
-      baseline_start = baseline_end - (baseline_minutes * 60)
+      # Integrated volume: each boundary bucket already holds only its partial
+      # in-run volume, so this is correct without trimming edges.
+      delivered_volume = run_buckets.sum { |b| b[:value] }
+      gross_gpm = delivered_volume / duration_min
+      delivered_gpm = gross_gpm - baseline_gpm
 
-      query = "select value from flow where time > '#{baseline_start.iso8601}' and time < '#{baseline_end.iso8601}'"
-      results = flume_client.query query
+      # Interior buckets fully inside the run: tb >= on AND tb+60 <= off.
+      interior = run_buckets.select do |b|
+        tb = b[:time].to_f
+        tb >= on.to_f && (tb + BUCKET_SECONDS) <= off.to_f
+      end
+      interior_values = interior.map { |b| b[:value] }
 
-      return nil if results.empty? || results.first['values'].empty?
-
-      results.first['values'].map { |r| r['value'].to_f }
-    end
-
-    def get_valve_flow(flume_client, on_time, off_time, ramp_up_minutes)
-      # Skip the ramp-up period
-      flow_start = on_time + (ramp_up_minutes * 60)
-      return nil if flow_start >= off_time
-
-      query = "select value from flow where time > '#{flow_start.iso8601}' and time < '#{off_time.iso8601}'"
-      results = flume_client.query query
-
-      return nil if results.empty? || results.first['values'].empty?
-
-      flow_data = results.first['values'].map do |rate|
-        {
-          time: Time.iso8601(rate['time']),
-          value: rate['value'].to_f
-        }
+      steady_median = steady_cv = nil
+      if interior_values.length >= MIN_INTERIOR_FOR_STEADY
+        steady_median = median(interior_values) - baseline_gpm
+        mean = interior_values.sum / interior_values.length.to_f
+        std  = Math.sqrt(interior_values.sum { |v| (v - mean)**2 } / interior_values.length)
+        steady_cv = mean.positive? ? std / mean : 0.0
       end
 
-      # Filter out obvious outliers (more than 3 standard deviations from median)
-      values = flow_data.map { |d| d[:value] }
-      median = values.sort[values.length / 2]
-      std_dev = Math.sqrt(values.map { |v| (v - median)**2 }.sum / values.length)
+      baseline_quiet = (baseline_before.nil? || baseline_before < QUIET_BASELINE_GPM) &&
+                       (baseline_after.nil?  || baseline_after  < QUIET_BASELINE_GPM)
 
-      flow_data.select { |d| (d[:value] - median).abs <= 3 * std_dev }
+      { delivered_gpm: delivered_gpm,
+        gross_gpm: gross_gpm,
+        delivered_volume: delivered_volume,
+        duration_minutes: duration_min,
+        baseline_before_gpm: baseline_before,
+        baseline_after_gpm: baseline_after,
+        baseline_gpm: baseline_gpm,
+        steady_median_gpm: steady_median,
+        steady_cv: steady_cv,
+        n_interior: interior_values.length,
+        n_run_buckets: run_buckets.length,
+        flow_detected: delivered_gpm >= FLOW_FLOOR_GPM,
+        baseline_quiet: baseline_quiet,
+        run_buckets: run_buckets }
     end
 
-    def calculate_flow_metrics(baseline_flow, valve_flow, event)
-      baseline_median = baseline_flow.sort[baseline_flow.length / 2]
-      baseline_mean = baseline_flow.sum / baseline_flow.length.to_f
-      baseline_std = Math.sqrt(baseline_flow.map { |v| (v - baseline_mean)**2 }.sum / baseline_flow.length)
+    # Median of flow within [start_t, end_t), clamped to stay clear of an
+    # adjacent run (prev_off / next_on). Returns nil if no samples remain.
+    def baseline_window(buckets, start_t, end_t, prev_off, next_on = nil)
+      lo = start_t.to_f
+      hi = end_t.to_f
+      lo = [lo, prev_off.to_f].max if prev_off
+      hi = [hi, next_on.to_f].min if next_on
+      return nil if hi <= lo
 
-      valve_values = valve_flow.map { |d| d[:value] }
-      valve_median = valve_values.sort[valve_values.length / 2]
-      valve_mean = valve_values.sum / valve_values.length.to_f
-      valve_max = valve_values.max
-      valve_std = Math.sqrt(valve_values.map { |v| (v - valve_mean)**2 }.sum / valve_values.length)
+      vals = buckets.select { |b| b[:time].to_f >= lo && b[:time].to_f < hi }.map { |b| b[:value] }
+      vals.empty? ? nil : median(vals)
+    end
 
-      # Calculate net flow increase
-      net_flow_increase = valve_median - baseline_median
-      flow_stability = valve_std / valve_mean # coefficient of variation
+    def fetch_flow(client, start_t, end_t)
+      query = "select value from flow where time > '#{Time.at(start_t).utc.iso8601}' " \
+              "and time < '#{Time.at(end_t).utc.iso8601}'"
+      results = client.query query
+      return [] if results.empty? || results.first['values'].empty?
 
-      {
-        baseline_median: baseline_median,
-        baseline_mean: baseline_mean,
-        baseline_std: baseline_std,
-        valve_median: valve_median,
-        valve_mean: valve_mean,
-        valve_max: valve_max,
-        valve_std: valve_std,
-        net_flow_increase: net_flow_increase,
-        flow_stability: flow_stability,
-        duration_minutes: event[:duration_minutes]
+      results.first['values'].map { |r| { time: Time.iso8601(r['time']), value: r['value'].to_f } }
+    end
+
+    # ---- influx point construction ------------------------------------------
+
+    def build_metric_point(m, event)
+      values = {
+        delivered_gpm: m[:delivered_gpm],
+        gross_gpm: m[:gross_gpm],
+        delivered_volume: m[:delivered_volume],
+        duration_minutes: m[:duration_minutes],
+        baseline_gpm: m[:baseline_gpm],
+        n_interior: m[:n_interior],
+        n_run_buckets: m[:n_run_buckets],
+        flow_detected: m[:flow_detected],
+        baseline_quiet: m[:baseline_quiet]
       }
+      values[:baseline_after_gpm] = m[:baseline_after_gpm] unless m[:baseline_after_gpm].nil?
+      values[:steady_median_gpm]  = m[:steady_median_gpm]  unless m[:steady_median_gpm].nil?
+      values[:steady_cv]          = m[:steady_cv]          unless m[:steady_cv].nil?
+
+      { series: 'valve_metrics',
+        values: values,
+        tags: { valve: format('%02d', event[:valve]) },
+        timestamp: InfluxDB.convert_timestamp(event[:on_time], 's') }
     end
 
-    def create_flow_data_points(valve_flow, valve_number)
-      valve_flow.map do |data_point|
-        {
-          series: 'flow',
-          values: { value: data_point[:value] },
+    def build_flow_points(run_buckets, valve_number)
+      run_buckets.map do |b|
+        { series: 'flow',
+          values: { value: b[:value] },
           tags: { valve: format('%02d', valve_number) },
-          timestamp: InfluxDB.convert_timestamp(data_point[:time], 's')
-        }
+          timestamp: InfluxDB.convert_timestamp(b[:time], 's') }
       end
     end
 
-    def create_baseline_data_point(metrics, valve_number)
-      {
-        series: 'valve_metrics',
-        values: {
-          baseline_median: metrics[:baseline_median],
-          valve_median: metrics[:valve_median],
-          valve_max: metrics[:valve_max],
-          net_flow_increase: metrics[:net_flow_increase],
-          flow_stability: metrics[:flow_stability],
-          duration_minutes: metrics[:duration_minutes]
-        },
-        tags: { valve: format('%02d', valve_number) }
-      }
-    end
+    # ---- statistics ----------------------------------------------------------
 
-    def update_anomaly_metrics(pluve_client)
-      # Calculate statistics for each valve over different time windows
-      time_windows = %w[7d 30d 90d]
-
-      time_windows.each do |window|
-        # Get flow metrics for each valve
-        metrics_query = 'select mean(net_flow_increase), stddev(net_flow_increase), ' \
-                        'mean(valve_max), stddev(valve_max), ' \
-                        'mean(flow_stability), stddev(flow_stability) ' \
-                        "from valve_metrics where time > now()-#{window} group by valve"
-
-        results = pluve_client.query metrics_query
-        next if results.empty?
-
-        anomaly_data = []
-        results.each do |valve_stats|
-          valve_num = valve_stats['tags']['valve']
-          values = valve_stats['values'][0]
-
-          # Calculate multiple anomaly scores
-          flow_z_score = calculate_z_score(
-            values['mean'], values['stddev'],
-            get_valve_population_mean(results, 'mean'),
-            get_valve_population_stddev(results, 'mean')
-          )
-
-          max_flow_z_score = calculate_z_score(
-            values['mean_1'], values['stddev_1'],
-            get_valve_population_mean(results, 'mean_1'),
-            get_valve_population_stddev(results, 'mean_1')
-          )
-
-          stability_z_score = calculate_z_score(
-            values['mean_2'], values['stddev_2'],
-            get_valve_population_mean(results, 'mean_2'),
-            get_valve_population_stddev(results, 'mean_2')
-          )
-
-          anomaly_data.push({ series: 'anomaly_scores',
-                              values: {
-                                flow_z_score: flow_z_score,
-                                max_flow_z_score: max_flow_z_score,
-                                stability_z_score: stability_z_score,
-                                composite_score: [flow_z_score.abs, max_flow_z_score.abs, stability_z_score.abs].max
-                              },
-                              tags: {
-                                valve: valve_num,
-                                window: window
-                              } })
-        end
-
-        pluve_client.write_points anomaly_data, 's' unless anomaly_data.empty?
-      end
-    end
-
-    def calculate_z_score(value, _std_dev, population_mean, population_std)
-      return 0.0 if population_std.nil? || population_std.zero?
-
-      (value - population_mean) / population_std
-    end
-
-    def get_valve_population_mean(results, field)
-      values = results.map { |r| r['values'][0][field] }.compact
-      values.sum / values.length.to_f
-    end
-
-    def get_valve_population_stddev(results, field)
-      values = results.map { |r| r['values'][0][field] }.compact
-      mean = values.sum / values.length.to_f
-      Math.sqrt(values.map { |v| (v - mean)**2 }.sum / values.length)
+    def median(values)
+      sorted = values.sort
+      mid = sorted.length / 2
+      sorted.length.odd? ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2.0
     end
   end
 end
