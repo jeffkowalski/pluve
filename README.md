@@ -205,6 +205,14 @@ faults. Root causes, all fixed:
 5. **Batch write-timestamps** (all runs stamped at cron time) made temporal
    analysis impossible and risked silent overwrites. → Real `on_time` timestamps.
 6. A stale **`z-score`** measurement (dead since 2025-09) was also **dropped**.
+7. **MAD floor was fractional (5% of median), which scaled the wrong way.** Most
+   valves are extremely precise (run-to-run MAD < 1% of flow), so a
+   flow-proportional floor pinned every precise valve to a ~26%-of-flow detection
+   threshold. A missing spray head on valve 26 (split driveway) raised flow ~10% —
+   real, sustained, ~17× the valve's own noise — and went unalerted. → Floor
+   changed to an **absolute** `MAD_FLOOR_GPM = 0.25` (a broken head adds a roughly
+   fixed GPM regardless of zone size). Backtested clean (catch, zero false
+   positives) over 0.12–0.40 GPM across all 30 valves / 90 days.
 
 ---
 
@@ -244,6 +252,12 @@ a wiring fault, exactly what `check_no_flow` reports. Flow resumed 2026-05-09
 (first run after the repair). Simulating the new detector mid-outage fires
 *"valve 5 no flow on 6 of 6 runs."* The data even supplied the outage onset the
 diary lacked.
+
+A second, opposite fault confirmed the *upper* side of the detector:
+**station 26 (split driveway) stepped from ~23.1 to ~25.4 GPM on 2026-06-20** and
+held there — a missing spray head adding ~10% flow. The original 5% MAD floor was
+blind to it (gotcha 7); the absolute 0.25 GPM floor catches it as
+*"valve 26 flow shifted up to 25.4 GPM"* with no false positives elsewhere.
 
 ---
 
