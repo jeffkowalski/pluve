@@ -156,7 +156,9 @@ per-valve, against its own history, robust (median + MAD modified z-score), and
   up = break/leak).
 - `check_absence` — a known valve silent > 21 days.
 - `check_leak` — fleet-wide median `baseline_gpm` > 0.5 GPM.
-- `check_processing_lag` — no new data in > 30 h (unless OSPI reports weather-skip).
+- `check_recorder_lag` — every OSPI valve run that started before pluve's most
+  recent cron slot (read from `crontab -l`) must have a `valve_metrics` point. Metric *age* is not
+  used: points are stamped at run time, so the newest is routinely a day old.
 
 Constants/thresholds are at the top of the `TestPluve` class.
 
